@@ -12,11 +12,16 @@
 import os
 import random
 import json
+
+import torch
+
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
+NORMALIZED_APPEARANCE_EMBEDDING_FILENAME = "normalized_appearance_embedding.pt"
 
 class Scene:
 
@@ -79,12 +84,32 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
+            self.gaussians.load_appearance_embedding(os.path.join(self.model_path,
+                                                           "point_cloud",
+                                                           "iteration_" + str(self.loaded_iter),
+                                                           "appearance_embedding.ckpt"))
+
+            normalized_appearance_embedding_path = os.path.join(self.model_path, NORMALIZED_APPEARANCE_EMBEDDING_FILENAME)
+            if os.path.exists(normalized_appearance_embedding_path):
+                print("load {}".format(normalized_appearance_embedding_path))
+                self.normalized_appearance_embedding = torch.load(normalized_appearance_embedding_path)
+            else:
+                print("use appearance_embedding_dict from scene_info.normalized_appearance_embedding_path")
+                self.normalized_appearance_embedding = scene_info.normalized_appearance_embedding
+
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+
+            self.normalized_appearance_embedding = scene_info.normalized_appearance_embedding
+            # save normalized_appearance_embedding
+            torch.save(self.normalized_appearance_embedding, os.path.join(self.model_path, NORMALIZED_APPEARANCE_EMBEDDING_FILENAME))
+            with open(os.path.join(self.model_path, "normalized_appearance_embedding.json"), "w") as f:
+                json.dump(self.normalized_appearance_embedding, f, indent=4)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_appearance_embedding(os.path.join(point_cloud_path, "appearance_embedding.ckpt"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

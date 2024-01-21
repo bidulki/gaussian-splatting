@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import tinycudann as tcnn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -29,7 +30,7 @@ class GaussianModel:
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -43,7 +44,7 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -54,9 +55,39 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.appearance_embedding_optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        self.appearance_embedding_config = {
+            "n_input_dims": 1,
+            "n_output_dims": 3,
+            "encoding_config": {
+                "otype": "Frequency",
+                "n_frequencies": 4
+            },
+            "network_config": {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "Sigmoid",
+                "n_neurons": 32,
+                "n_hidden_layers": 2
+            },
+            "seed": 1337,
+        }
+
+        self.appearance_embedding_optimizer_config = {
+            "lr": 1e-3,
+            "eps": 1e-15,
+        }
+
+        self.appearance_embedding = None
+
         self.setup_functions()
+
+    def init_appearance_embedding_model(self):
+        if self.appearance_embedding_config is not None:
+            self.appearance_embedding = tcnn.NetworkWithInputEncoding(**self.appearance_embedding_config)
 
     def capture(self):
         return (
@@ -72,48 +103,60 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.appearance_embedding_config,
+            self.appearance_embedding.state_dict() if self.appearance_embedding is not None else None,
+            self.appearance_embedding_optimizer_config,
+            self.appearance_embedding_optimizer.state_dict() if self.appearance_embedding_optimizer is not None else None,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        opt_dict,
+        self.spatial_lr_scale,
+        self.appearance_embedding_config,
+        appearance_embedding_state_dict,
+        appearance_embedding_optimizer_config,
+        appearance_embedding_optimizer_state_dict) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+        if self.appearance_embedding is not None:
+            self.appearance_embedding.load_state_dict(appearance_embedding_state_dict)
+            self.appearance_embedding_optimizer.load_state_dict(appearance_embedding_optimizer_state_dict)
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
-    
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-    
+
     @property
     def get_xyz(self):
         return self._xyz
-    
+
     @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -150,6 +193,18 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        # init appearance embedding model
+        if training_args.disable_appearance_embedding is False:
+            self.init_appearance_embedding_model()
+            self.appearance_embedding.to("cuda")
+
+            self.appearance_embedding_optimizer = torch.optim.Adam(
+                list(self.appearance_embedding.parameters()),
+                **self.appearance_embedding_optimizer_config,
+            )
+        else:
+            print("disable appearance embedding")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -207,6 +262,14 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+    def save_appearance_embedding(self, path):
+        if self.appearance_embedding is not None:
+            mkdir_p(os.path.dirname(path))
+            torch.save({
+                "model_config": self.appearance_embedding_config,
+                "model_state_dict": self.appearance_embedding.state_dict(),
+            }, path)
+
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
@@ -254,6 +317,21 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+
+    def load_appearance_embedding(self, path):
+        if os.path.exists(path):
+            checkpoint = torch.load(path)
+            # load config
+            self.appearance_embedding_config = checkpoint["model_config"]
+            # init model based on config
+            self.init_appearance_embedding_model()
+            # load model state dict
+            self.appearance_embedding.load_state_dict(checkpoint["model_state_dict"])
+
+            self.appearance_embedding.to("cuda")
+        else:
+            print("disable appearance embedding")
+            self.appearance_embedding = None
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -376,7 +454,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]

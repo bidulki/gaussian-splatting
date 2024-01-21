@@ -15,13 +15,13 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, rgb_factors = None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -91,6 +91,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+
+    # Appearance embedding
+    if rgb_factors is not None:
+        appearance_factors = torch.reshape(rgb_factors.to(rendered_image), (-1, 1, 1))
+    elif pc.appearance_embedding is not None:
+        appearance_embedding_input = [[viewpoint_camera.appearance_embedding]]
+        appearance_factors = pc.appearance_embedding(torch.tensor(
+            appearance_embedding_input,
+            dtype=rendered_image.dtype,
+        ).to(rendered_image)).reshape((-1, 1, 1))
+    else:
+        appearance_factors = None
+    if appearance_factors is not None:
+        rendered_image = rendered_image * appearance_factors
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
